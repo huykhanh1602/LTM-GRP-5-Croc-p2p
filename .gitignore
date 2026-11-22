@@ -1,0 +1,44 @@
+# Build artifacts
+/croc-p2p
+/croc-p2p.exe
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+*.prof
+
+# Go workspace / tooling
+*.exe~
+*.dll
+*.so
+*.dylib
+/vendor/
+go.work
+go.work.sum
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE / editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
+coverage.txt
