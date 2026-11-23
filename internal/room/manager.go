@@ -32,6 +32,9 @@ var _ protocol.RoomManager = (*Manager)(nil)
 // Manager tracks the local peer, the member list and subscribers.
 type Manager struct {
 	relayAddr string
+	// signaler carries the control messages. Manager never dials anything
+	// directly, which keeps the roster/election logic testable.
+	signaler Signaler
 
 	mu            sync.RWMutex
 	roomID        string
@@ -44,25 +47,68 @@ type Manager struct {
 
 	heartbeatInterval time.Duration
 	peerTimeout       time.Duration
-	cancel            context.CancelFunc
-	wg                sync.WaitGroup
+	joinTimeout       time.Duration
+	retryAttempts     int
+	retryBase         time.Duration
+	retryMax          time.Duration
+	pendingPings      map[pingKey]chan struct{}
+	// lastJoinAt is the newest arrival stamp this peer handed out as
+	// coordinator (see stampArrivalLocked).
+	lastJoinAt time.Time
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
+// pingKey identifies one outstanding PING. The echoed timestamp works as a
+// correlation ID without adding a request ID to the wire format.
+type pingKey struct {
+	peerID string
+	sent   time.Time
+}
+
+// defaultJoinTimeout bounds how long a newcomer waits for PEER_LIST.
+const defaultJoinTimeout = 5 * time.Second
+
 // New returns a room manager targeting relayAddr (empty uses DefaultRelay).
+//
+// TODO(member-3): wire this to signaler_relay.go. Until the relay room naming
+// and the PAKE-covered channel are agreed with Khanh/Hoang it keeps using a
+// private in-memory network, so a Manager started this way cannot reach another
+// process yet.
 func New(relayAddr string) *Manager {
 	if relayAddr == "" {
 		relayAddr = protocol.DefaultRelay
 	}
+	m := NewWithSignaler(nil)
+	m.relayAddr = relayAddr
+	return m
+}
+
+// NewWithSignaler returns a room manager whose control messages travel through
+// sig. A nil sig falls back to a private in-memory network.
+func NewWithSignaler(sig Signaler) *Manager {
+	if sig == nil {
+		sig = NewLocalNetwork().Signaler()
+	}
 	return &Manager{
-		relayAddr:         relayAddr,
+		relayAddr:         protocol.DefaultRelay,
+		signaler:          sig,
 		peers:             make(map[string]protocol.PeerInfo),
 		subscribers:       make(map[uint64]func(protocol.ControlMessage)),
 		heartbeatInterval: protocol.DefaultHeartbeatInterval,
 		peerTimeout:       protocol.DefaultPeerTimeout,
+		joinTimeout:       defaultJoinTimeout,
+		retryAttempts:     DefaultJoinAttempts,
+		retryBase:         DefaultRetryBase,
+		retryMax:          DefaultRetryMax,
+		pendingPings:      make(map[pingKey]chan struct{}),
 	}
 }
 
 // CreateRoom starts a room and makes this peer the first coordinator.
+//
+// The coordinator keeps the waiting room open for the whole session so
+// newcomers can find it (spec #1).
 func (m *Manager) CreateRoom(ctx context.Context, roomID, secret string) (protocol.PeerInfo, error) {
 	if roomID == "" {
 		return protocol.PeerInfo{}, fmt.Errorf("room: room id is required: %w", protocol.ErrInvalidMessage)
@@ -72,6 +118,10 @@ func (m *Manager) CreateRoom(ctx context.Context, roomID, secret string) (protoc
 	}
 
 	self := newSelfPeer(true)
+	lobby := lobbyRoomID(roomID)
+	if err := joinWithRetry(ctx, m.signaler, lobby, self, m.retryAttempts, m.retryBase, m.retryMax); err != nil {
+		return protocol.PeerInfo{}, fmt.Errorf("room: open waiting room %q: %w", lobby, err)
+	}
 
 	m.mu.Lock()
 	m.roomID = roomID
@@ -79,23 +129,27 @@ func (m *Manager) CreateRoom(ctx context.Context, roomID, secret string) (protoc
 	m.coordinatorID = self.ID
 	m.term++
 	m.peers = map[string]protocol.PeerInfo{self.ID: self}
+	m.lastJoinAt = self.JoinedAt
 	m.mu.Unlock()
 
-	// TODO(member-3): connect to m.relayAddr and authenticate the room with
-	// the PAKE-derived key. Until then membership is process-local.
+	// TODO(member-3): authenticate the room with the PAKE-derived key before
+	// accepting any control message (Hoang, internal/security).
 	_ = secret
 
-	m.startHeartbeat(ctx)
+	m.startLoops(ctx)
 	return self, nil
 }
 
 // JoinRoom adds this peer to an existing room.
 //
-// Joining never promotes the caller to coordinator. The roster (coordinator ID
-// and term included) must come from the coordinator in PEER_LIST, and a peer
-// only takes the role over through electCoordinator once the current
-// coordinator is gone. Joiners used to promote themselves whenever their local
-// coordinatorID was empty, so every joiner believed it was the coordinator.
+// Handshake (spec #1/#2):
+//  1. join the coordinator's waiting room, retrying while it is occupied;
+//  2. send JOIN and wait for PEER_LIST, which carries the roster, the priority
+//     order and the roster term;
+//  3. leave the waiting room so the slot is free for the next newcomer.
+//
+// Joining never promotes the caller to coordinator: a peer only takes the role
+// over through an election once the current coordinator is gone.
 func (m *Manager) JoinRoom(ctx context.Context, roomID, secret string) (protocol.PeerInfo, []protocol.PeerInfo, error) {
 	if roomID == "" {
 		return protocol.PeerInfo{}, nil, fmt.Errorf("room: room id is required: %w", protocol.ErrInvalidMessage)
@@ -104,43 +158,62 @@ func (m *Manager) JoinRoom(ctx context.Context, roomID, secret string) (protocol
 		return protocol.PeerInfo{}, nil, err
 	}
 
+	m.mu.RLock()
+	currentRoom, selfID := m.roomID, m.self.ID
+	currentSelf, currentRoster := m.self, snapshotPeers(m.peers)
+	m.mu.RUnlock()
+
+	if currentRoom != "" && currentRoom != roomID {
+		return protocol.PeerInfo{}, nil, fmt.Errorf("room: already in room %q: %w", currentRoom, protocol.ErrInvalidMessage)
+	}
+	if currentRoom == roomID && selfID != "" {
+		// Already a member: a repeated join keeps the identity and the roster so
+		// it cannot leave a second, permanent entry behind.
+		return currentSelf, currentRoster, nil
+	}
+
 	self := newSelfPeer(false)
+	// The handshake below reads the inbound stream itself, so stop any loops
+	// left over from an earlier membership; they are restarted after the join.
+	m.stopLoops()
+
+	lobby := lobbyRoomID(roomID)
+	if err := joinWithRetry(ctx, m.signaler, lobby, self, m.retryAttempts, m.retryBase, m.retryMax); err != nil {
+		return protocol.PeerInfo{}, nil, fmt.Errorf("room: join waiting room %q: %w", lobby, err)
+	}
+	// Whatever happens next, the slot must be free for the next newcomer.
+	defer func() { _ = m.signaler.Leave(context.Background(), lobby) }()
+
+	join := protocol.NewControlMessage(protocol.MsgJoin, roomID, self.ID)
+	join.Peer = &self
+	if err := m.signaler.SendRoom(ctx, lobby, *join); err != nil {
+		return protocol.PeerInfo{}, nil, fmt.Errorf("room: send JOIN: %w", err)
+	}
+
+	list, err := m.waitForPeerList(ctx, m.joinTimeout)
+	if err != nil {
+		return protocol.PeerInfo{}, nil, err
+	}
 
 	m.mu.Lock()
-	if m.roomID != "" && m.roomID != roomID {
-		m.mu.Unlock()
-		return protocol.PeerInfo{}, nil, fmt.Errorf("room: already in room %q: %w", m.roomID, protocol.ErrInvalidMessage)
-	}
-	if m.self.ID != "" {
-		// Already a member of this room: keep the existing identity so a
-		// repeated join cannot leave a second, permanent entry in the roster
-		// (the old entry would stay "online" and could win an election).
-		current, roster := m.self, snapshotPeers(m.peers)
-		m.mu.Unlock()
-		return current, roster, nil
-	}
-	if m.peers == nil {
-		m.peers = make(map[string]protocol.PeerInfo)
-	}
 	m.roomID = roomID
 	m.self = self
-	m.peers[self.ID] = self
-	peers := snapshotPeers(m.peers)
-	// NOTE: coordinatorID and term are deliberately left untouched here; a join
-	// must not open a new term.
-	// TODO(member-3): fetch PEER_LIST from the coordinator through the relay
-	// before returning, then merge that roster (and its term) into m.peers.
+	m.applyRosterLocked(list)
+	joined, roster := m.self, snapshotPeers(m.peers)
 	m.mu.Unlock()
 
-	// TODO(member-3): run the PAKE JOIN handshake through the relay before
-	// accepting the member list from the coordinator.
+	// TODO(member-3): run the PAKE handshake (Hoang) before trusting the roster.
 	_ = secret
 
-	m.startHeartbeat(ctx)
-	return self, peers, nil
+	m.startLoops(ctx)
+	return joined, roster, nil
 }
 
-// LeaveRoom removes this peer and triggers an election if it was coordinator.
+// LeaveRoom removes this peer from the room.
+//
+// The departure is announced, and a leaving coordinator hands the role to its
+// successor with a new term, so the room does not have to wait for a timeout.
+// When the room empties there is no coordinator left.
 func (m *Manager) LeaveRoom(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -151,22 +224,54 @@ func (m *Manager) LeaveRoom(ctx context.Context) error {
 		m.mu.Unlock()
 		return nil
 	}
-	roomID := m.roomID
-	self := m.self
+	roomID, self := m.roomID, m.self
 	wasCoordinator := m.coordinatorID == self.ID
-	delete(m.peers, self.ID)
+	next, hasNext := m.successorLocked()
+	term := m.term
+
+	others := make([]protocol.PeerInfo, 0, len(m.peers))
+	for _, peer := range m.peers {
+		if peer.ID != self.ID {
+			others = append(others, peer)
+		}
+	}
+
+	m.peers = make(map[string]protocol.PeerInfo)
 	m.self = protocol.PeerInfo{}
 	m.roomID = ""
+	m.coordinatorID = ""
 	m.mu.Unlock()
 
-	leave := protocol.NewControlMessage(protocol.MsgLeave, roomID, self.ID)
-	m.publish(*leave)
+	leave := *protocol.NewControlMessage(protocol.MsgLeave, roomID, self.ID)
+	var handoff protocol.ControlMessage
+	if wasCoordinator && hasNext {
+		handoff = *protocol.NewControlMessage(protocol.MsgElectCoordinator, roomID, self.ID)
+		handoff.Election = &protocol.ElectionInfo{
+			CoordinatorID: next.ID,
+			Term:          term + 1,
+			Reason:        "coordinator left",
+		}
+	}
 
-	if wasCoordinator {
-		// TODO(member-3): this election runs on the local roster and is announced
-		// with an empty RoomID (LeaveRoom already cleared it) and a hard-coded
-		// reason. Phase 3 must broadcast it for the room that was just left.
-		m.electCoordinator()
+	for _, peer := range others {
+		if err := m.signaler.Send(context.Background(), peer.ID, leave); err != nil {
+			// Already unreachable; its own timeout handles the rest.
+			continue
+		}
+		if wasCoordinator && hasNext {
+			_ = m.signaler.Send(context.Background(), peer.ID, handoff)
+		}
+	}
+
+	m.publish(leave)
+	if wasCoordinator && hasNext {
+		m.publish(handoff)
+	}
+
+	// Free the waiting-room slot. Pair-room teardown belongs to the relay
+	// signaler (TODO: agree the room lifecycle with Khanh).
+	if err := m.signaler.Leave(context.Background(), lobbyRoomID(roomID)); err != nil {
+		return fmt.Errorf("room: leave waiting room %q: %w", lobbyRoomID(roomID), err)
 	}
 	return nil
 }
@@ -232,25 +337,57 @@ func (m *Manager) PublishBitfield(ctx context.Context, update protocol.BitfieldU
 //
 // TODO(member-3): send a PING over the relay and return the measured RTT when
 // the matching PONG arrives. The scaffold updates LastSeen immediately.
+// Heartbeat pings peerID and returns the measured round-trip time.
+//
+// The PING carries its send timestamp and the PONG echoes it, which correlates
+// the reply with its request without adding a request ID to the wire format.
 func (m *Manager) Heartbeat(ctx context.Context, peerID string) (time.Duration, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
-	m.mu.Lock()
-	peer, ok := m.peers[peerID]
-	if !ok {
-		m.mu.Unlock()
+	m.mu.RLock()
+	roomID, selfID := m.roomID, m.self.ID
+	_, known := m.peers[peerID]
+	m.mu.RUnlock()
+	if roomID == "" || !known {
 		return 0, fmt.Errorf("room: heartbeat %q: %w", peerID, protocol.ErrPeerOffline)
 	}
-	peer.LastSeen = time.Now().UTC()
-	if peer.Status == protocol.PeerOffline {
-		peer.Status = protocol.PeerOnline
+
+	start := time.Now()
+	ping := protocol.NewControlMessage(protocol.MsgPing, roomID, selfID)
+	ping.Timestamp = start.UTC()
+
+	key := pingKey{peerID: peerID, sent: ping.Timestamp}
+	wait := make(chan struct{}, 1)
+
+	m.mu.Lock()
+	if m.pendingPings == nil {
+		m.pendingPings = make(map[pingKey]chan struct{})
 	}
-	m.peers[peerID] = peer
+	m.pendingPings[key] = wait
 	m.mu.Unlock()
 
-	return 0, nil
+	defer func() {
+		m.mu.Lock()
+		delete(m.pendingPings, key)
+		m.mu.Unlock()
+	}()
+
+	if err := m.signaler.Send(ctx, peerID, *ping); err != nil {
+		return 0, fmt.Errorf("room: ping %q: %w", peerID, err)
+	}
+
+	timer := time.NewTimer(m.peerTimeout)
+	defer timer.Stop()
+	select {
+	case <-wait:
+		return time.Since(start), nil
+	case <-timer.C:
+		return 0, fmt.Errorf("room: heartbeat %q timed out: %w", peerID, protocol.ErrPeerOffline)
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 }
 
 // Subscribe registers a handler and returns an idempotent unsubscribe func.
@@ -271,8 +408,20 @@ func (m *Manager) Subscribe(handler func(protocol.ControlMessage)) func() {
 	}
 }
 
-// Close stops the background heartbeat loop.
+// Close stops the background loops and releases the signaler.
 func (m *Manager) Close() error {
+	m.stopLoops()
+
+	if m.signaler != nil {
+		if err := m.signaler.Close(); err != nil {
+			return fmt.Errorf("room: close signaler: %w", err)
+		}
+	}
+	return nil
+}
+
+// stopLoops stops the receive and heartbeat loops. Calling it twice is safe.
+func (m *Manager) stopLoops() {
 	m.mu.Lock()
 	cancel := m.cancel
 	m.cancel = nil
@@ -282,10 +431,10 @@ func (m *Manager) Close() error {
 		cancel()
 	}
 	m.wg.Wait()
-	return nil
 }
 
-func (m *Manager) startHeartbeat(ctx context.Context) {
+// startLoops starts the receive loop and the heartbeat loop.
+func (m *Manager) startLoops(ctx context.Context) {
 	m.mu.Lock()
 	if m.cancel != nil {
 		m.mu.Unlock()
@@ -295,7 +444,11 @@ func (m *Manager) startHeartbeat(ctx context.Context) {
 	m.cancel = cancel
 	m.mu.Unlock()
 
-	m.wg.Add(1)
+	m.wg.Add(2)
+	go func() {
+		defer m.wg.Done()
+		m.recvLoop(loopCtx)
+	}()
 	go func() {
 		defer m.wg.Done()
 		m.heartbeatLoop(loopCtx)
@@ -309,10 +462,90 @@ func (m *Manager) heartbeatLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
-			m.sweep(now)
+		case <-ticker.C:
+			m.tick(ctx)
 		}
 	}
+}
+
+// tick runs one liveness round.
+//
+// Roles (spec #4):
+//   - the coordinator pings every member, so a dead member is noticed and the
+//     roster is re-broadcast;
+//   - the successor (the next peer in priority order) pings the coordinator, so
+//     a silent coordinator is noticed;
+//   - everybody else stays quiet and follows PEER_LIST updates.
+func (m *Manager) tick(ctx context.Context) {
+	m.mu.RLock()
+	roomID := m.roomID
+	m.mu.RUnlock()
+	if roomID == "" {
+		return
+	}
+
+	m.sweep(time.Now())
+
+	m.mu.RLock()
+	selfID, coordID := m.self.ID, m.coordinatorID
+	peers := snapshotPeers(m.peers)
+	m.mu.RUnlock()
+	if coordID == "" {
+		return
+	}
+
+	if coordID == selfID {
+		for _, peer := range peers {
+			if peer.ID == selfID || peer.Status == protocol.PeerOffline {
+				continue
+			}
+			if _, err := m.Heartbeat(ctx, peer.ID); err != nil {
+				m.markOffline(peer.ID)
+				m.broadcastRoster("peer timed out")
+			}
+		}
+		return
+	}
+
+	next, ok := m.successor()
+	if !ok || next.ID != selfID {
+		return
+	}
+	if _, err := m.Heartbeat(ctx, coordID); err != nil {
+		m.coordinatorSilent("coordinator silent")
+	}
+}
+
+// successor returns the next coordinator in priority order: the earliest-joined
+// online member after the current coordinator. Every peer computes the same
+// answer from the same roster, which keeps hand-overs deterministic.
+func (m *Manager) successor() (protocol.PeerInfo, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.successorLocked()
+}
+
+// successorLocked is successor for callers that already hold m.mu.
+func (m *Manager) successorLocked() (protocol.PeerInfo, bool) {
+	coord, ok := m.peers[m.coordinatorID]
+	if !ok {
+		return protocol.PeerInfo{}, false
+	}
+
+	var best protocol.PeerInfo
+	found := false
+	for _, peer := range m.peers {
+		if peer.ID == coord.ID || peer.Status == protocol.PeerOffline {
+			continue
+		}
+		if !joinedBefore(coord, peer) {
+			continue
+		}
+		if !found || joinedBefore(peer, best) {
+			best, found = peer, true
+		}
+	}
+	return best, found
 }
 
 // sweep marks silent peers offline and starts an election if needed.
@@ -349,73 +582,60 @@ func (m *Manager) sweep(now time.Time) {
 	}
 
 	if coordinatorDown {
-		m.electCoordinator()
+		// Only the successor takes the role over; every other peer waits for
+		// its announcement (spec #4).
+		m.coordinatorSilent("coordinator timeout")
 	}
 }
 
-// electCoordinator hands the coordinator role to the earliest surviving member
-// when the current coordinator is gone (or was never known).
+// coordinatorSilent hands the role to this peer when it is the successor and
+// the coordinator stopped answering. It bumps the term and announces the result
+// to everybody so the room converges on one coordinator (spec #4).
 //
-// "Earliest" is arrival order, read from PeerInfo.JoinedAt (see joinedBefore).
-// Every peer evaluates the same roster, so the result converges without extra
-// coordination.
-func (m *Manager) electCoordinator() {
+// A peer that is not the successor does nothing: the peer in front of it is
+// still alive and reacts to the same silence.
+func (m *Manager) coordinatorSilent(reason string) {
 	m.mu.Lock()
-	if len(m.peers) == 0 {
+	if m.roomID == "" || m.self.ID == "" || m.coordinatorID == m.self.ID {
 		m.mu.Unlock()
 		return
 	}
-	if cur, ok := m.peers[m.coordinatorID]; ok && cur.Status != protocol.PeerOffline {
-		m.mu.Unlock()
-		return
-	}
-
-	// Map iteration order is random, so compare candidates explicitly instead
-	// of taking the first online entry.
-	newID := ""
-	found := false
-	for id, peer := range m.peers {
-		if peer.Status == protocol.PeerOffline {
-			continue
-		}
-		if !found || joinedBefore(peer, m.peers[newID]) {
-			newID, found = id, true
-		}
-	}
-	if !found {
+	next, ok := m.successorLocked()
+	if !ok || next.ID != m.self.ID {
 		m.mu.Unlock()
 		return
 	}
 
-	m.coordinatorID = newID
+	oldCoordinator := m.coordinatorID
+	if peer, ok := m.peers[oldCoordinator]; ok && peer.Status != protocol.PeerOffline {
+		peer.Status = protocol.PeerOffline
+		m.peers[oldCoordinator] = peer
+	}
+
+	m.coordinatorID = m.self.ID
 	m.term++
 	term := m.term
-
-	if peer, ok := m.peers[newID]; ok {
-		peer.Coordinator = true
-		m.peers[newID] = peer
-		if newID == m.self.ID {
-			m.self = peer
-		}
-	}
+	self := m.self
+	self.Coordinator = true
+	m.self = self
+	m.peers[self.ID] = self
 	for id, peer := range m.peers {
-		if id != newID && peer.Coordinator {
+		if id != self.ID && peer.Coordinator {
 			peer.Coordinator = false
 			m.peers[id] = peer
 		}
 	}
 	roomID := m.roomID
-	selfID := m.self.ID
 	m.mu.Unlock()
 
-	msg := protocol.NewControlMessage(protocol.MsgElectCoordinator, roomID, selfID)
+	msg := protocol.NewControlMessage(protocol.MsgElectCoordinator, roomID, self.ID)
 	msg.Election = &protocol.ElectionInfo{
-		CoordinatorID: newID,
+		CoordinatorID: self.ID,
 		Term:          term,
-		Reason:        "coordinator timeout",
+		Reason:        reason,
 	}
-	// TODO(member-3): broadcast the election result through the relay so all
-	// peers converge on the same term.
+	m.broadcast(*msg)
+	m.broadcastRoster("new coordinator")
 	m.publish(*msg)
 }
 
@@ -463,12 +683,14 @@ func joinedBefore(a, b protocol.PeerInfo) bool {
 	}
 }
 
+// snapshotPeers returns the roster in coordinator priority order: earliest
+// arrival first, ties broken by peer ID (see joinedBefore).
 func snapshotPeers(peers map[string]protocol.PeerInfo) []protocol.PeerInfo {
 	out := make([]protocol.PeerInfo, 0, len(peers))
 	for _, peer := range peers {
 		out = append(out, peer)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	sort.Slice(out, func(i, j int) bool { return joinedBefore(out[i], out[j]) })
 	return out
 }
 
