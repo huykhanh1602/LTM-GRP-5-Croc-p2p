@@ -89,9 +89,13 @@ func (m *Manager) CreateRoom(ctx context.Context, roomID, secret string) (protoc
 	return self, nil
 }
 
-// JoinRoom adds this peer to an existing room. The first member in a room
-// becomes the coordinator; otherwise the coordinator is discovered via the
-// relay PEER_LIST response.
+// JoinRoom adds this peer to an existing room.
+//
+// Joining never promotes the caller to coordinator. The roster (coordinator ID
+// and term included) must come from the coordinator in PEER_LIST, and a peer
+// only takes the role over through electCoordinator once the current
+// coordinator is gone. Joiners used to promote themselves whenever their local
+// coordinatorID was empty, so every joiner believed it was the coordinator.
 func (m *Manager) JoinRoom(ctx context.Context, roomID, secret string) (protocol.PeerInfo, []protocol.PeerInfo, error) {
 	if roomID == "" {
 		return protocol.PeerInfo{}, nil, fmt.Errorf("room: room id is required: %w", protocol.ErrInvalidMessage)
@@ -107,18 +111,25 @@ func (m *Manager) JoinRoom(ctx context.Context, roomID, secret string) (protocol
 		m.mu.Unlock()
 		return protocol.PeerInfo{}, nil, fmt.Errorf("room: already in room %q: %w", m.roomID, protocol.ErrInvalidMessage)
 	}
+	if m.self.ID != "" {
+		// Already a member of this room: keep the existing identity so a
+		// repeated join cannot leave a second, permanent entry in the roster
+		// (the old entry would stay "online" and could win an election).
+		current, roster := m.self, snapshotPeers(m.peers)
+		m.mu.Unlock()
+		return current, roster, nil
+	}
 	if m.peers == nil {
 		m.peers = make(map[string]protocol.PeerInfo)
 	}
 	m.roomID = roomID
-	if m.coordinatorID == "" {
-		self.Coordinator = true
-		m.coordinatorID = self.ID
-		m.term++
-	}
 	m.self = self
 	m.peers[self.ID] = self
 	peers := snapshotPeers(m.peers)
+	// NOTE: coordinatorID and term are deliberately left untouched here; a join
+	// must not open a new term.
+	// TODO(member-3): fetch PEER_LIST from the coordinator through the relay
+	// before returning, then merge that roster (and its term) into m.peers.
 	m.mu.Unlock()
 
 	// TODO(member-3): run the PAKE JOIN handshake through the relay before
@@ -152,6 +163,9 @@ func (m *Manager) LeaveRoom(ctx context.Context) error {
 	m.publish(*leave)
 
 	if wasCoordinator {
+		// TODO(member-3): this election runs on the local roster and is announced
+		// with an empty RoomID (LeaveRoom already cleared it) and a hard-coded
+		// reason. Phase 3 must broadcast it for the room that was just left.
 		m.electCoordinator()
 	}
 	return nil
@@ -339,7 +353,12 @@ func (m *Manager) sweep(now time.Time) {
 	}
 }
 
-// electCoordinator rotates the coordinator to the lowest online peer ID.
+// electCoordinator hands the coordinator role to the earliest surviving member
+// when the current coordinator is gone (or was never known).
+//
+// "Earliest" is arrival order, read from PeerInfo.JoinedAt (see joinedBefore).
+// Every peer evaluates the same roster, so the result converges without extra
+// coordination.
 func (m *Manager) electCoordinator() {
 	m.mu.Lock()
 	if len(m.peers) == 0 {
@@ -351,18 +370,22 @@ func (m *Manager) electCoordinator() {
 		return
 	}
 
-	online := make([]string, 0, len(m.peers))
+	// Map iteration order is random, so compare candidates explicitly instead
+	// of taking the first online entry.
+	newID := ""
+	found := false
 	for id, peer := range m.peers {
-		if peer.Status != protocol.PeerOffline {
-			online = append(online, id)
+		if peer.Status == protocol.PeerOffline {
+			continue
+		}
+		if !found || joinedBefore(peer, m.peers[newID]) {
+			newID, found = id, true
 		}
 	}
-	if len(online) == 0 {
+	if !found {
 		m.mu.Unlock()
 		return
 	}
-	sort.Strings(online)
-	newID := online[0]
 
 	m.coordinatorID = newID
 	m.term++
@@ -406,6 +429,37 @@ func (m *Manager) publish(msg protocol.ControlMessage) {
 
 	for _, handler := range handlers {
 		handler(msg)
+	}
+}
+
+// joinedBefore reports whether a has coordinator priority over b.
+//
+// Priority is arrival order: the peer that entered the room first is the
+// coordinator, and the earliest surviving member takes over when that peer
+// leaves or times out. Arrival order comes from PeerInfo.JoinedAt; peers that
+// publish the same timestamp (or none at all) are ordered by peer ID so every
+// machine computes the same winner.
+//
+// NOTE: JoinedAt is currently stamped by each peer's own clock, and clocks can
+// drift between machines (a peer with a fast clock looks "earlier" than it
+// really is). Long term the coordinator should assign JoinedAt/join order when
+// it accepts a JOIN and re-broadcast it in PEER_LIST; that is not implemented
+// yet because it depends on the relay handshake still being designed with
+// Khanh/Hoang.
+func joinedBefore(a, b protocol.PeerInfo) bool {
+	switch {
+	case a.JoinedAt.IsZero() && b.JoinedAt.IsZero():
+		return a.ID < b.ID
+	case a.JoinedAt.IsZero():
+		// Unknown join time counts as "joined last": a peer must not inherit
+		// the coordinator role because its timestamp was lost on the wire.
+		return false
+	case b.JoinedAt.IsZero():
+		return true
+	case !a.JoinedAt.Equal(b.JoinedAt):
+		return a.JoinedAt.Before(b.JoinedAt)
+	default:
+		return a.ID < b.ID
 	}
 }
 
